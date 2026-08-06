@@ -122,6 +122,24 @@
 
 ## 🛠️ Docker 部署
 
+## pmgr 远程启动
+
+本机已配置到 `192.168.2.157` 的免密 SSH 后，可直接运行：
+
+```bash
+./start.sh
+```
+
+脚本通过 SSH 启动 `192.168.2.157` 上的 `jimeng-free-api` Docker 容器，并建立 `http://127.0.0.1:18001` 本地隧道供 pmgr 健康检查和访问。服务实际运行在 `http://192.168.2.157:8001`；终止脚本时会在远端停止该容器。
+
+仓库内的 `pmgr-app.json` 可由 pmgr 读取：
+
+```bash
+pmgr project app-configure jimeng-free-api-all
+pmgr project app-start jimeng-free-api-all
+pmgr project app-open jimeng-free-api-all
+```
+
 使用预构建镜像一键启动：
 
 ```bash
