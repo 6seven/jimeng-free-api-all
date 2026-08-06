@@ -8,6 +8,7 @@
 .vscode
 .idea
 *.log
+logs*.txt
 logs
 
 # 构建产物（会在容器内重新构建）
@@ -32,5 +33,6 @@ __tests__
 *.zip
 .DS_Store
 Thumbs.db
+.env
 .env.local
 .env.development

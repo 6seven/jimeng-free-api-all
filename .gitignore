@@ -4,6 +4,7 @@ logs/
 .vercel
 .worktrees/
 work/
+.env
 
 # Database files
 data/
