@@ -3,9 +3,10 @@ import _ from "lodash";
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
 import util from "@/lib/util.ts";
-import { getCredit, receiveCredit, request, uploadFile } from "./core.ts";
+import { ensureCreditAvailable, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
 import { JimengModelConfig, resolveVideoModelConfig } from "./models.ts";
+import { getVideoDurationFallbacks } from "./video-policy.ts";
 
 const DEFAULT_ASSISTANT_ID = 513695;
 export const DEFAULT_MODEL = "jimeng-video-seedance-2.0-mini";
@@ -335,8 +336,7 @@ export async function generateVideo(
   );
 
   // 检查积分
-  const { totalCredit } = await getCredit(refreshToken);
-  if (totalCredit <= 0) await receiveCredit(refreshToken);
+  await ensureCreditAvailable(refreshToken);
 
   // 处理首帧和尾帧图片
   let first_frame_image = undefined;
@@ -611,32 +611,55 @@ export async function generateVideoWithRetry(
     resolution?: string;
     duration?: number;
     filePaths?: string[];
+    fallbackPolicy?: "auto" | "exact";
   },
   refreshToken: string
 ): Promise<string> {
-  // 降级策略: 先降分辨率，再降时长
+  const { fallbackPolicy = "auto", ...generationOptions } = options;
   const modelConfig = await resolveVideoModelConfig(_model, refreshToken);
-  const resolutionLevels = getVideoResolutionFallbacks(
+  if (
+    fallbackPolicy === "exact" &&
+    options.resolution &&
+    !modelConfig.supportedResolutions.includes(options.resolution)
+  ) {
+    throw new APIException(
+      EX.API_REQUEST_PARAMS_INVALID,
+      `模型 ${_model} 不支持分辨率 ${options.resolution}`
+    );
+  }
+  const availableResolutionLevels = getVideoResolutionFallbacks(
     _model,
     options.resolution,
     modelConfig
   );
-  const durationLevels = [10, 5];
+  const resolutionLevels = fallbackPolicy === "exact"
+    ? availableResolutionLevels.slice(0, 1)
+    : availableResolutionLevels;
+  let durationLevels: number[];
+  try {
+    durationLevels = getVideoDurationFallbacks(
+      options.duration,
+      fallbackPolicy,
+      modelConfig.supportsLongDuration ?? false
+    );
+  } catch (error) {
+    throw new APIException(
+      EX.API_REQUEST_PARAMS_INVALID,
+      error instanceof Error ? error.message : "视频时长参数无效"
+    );
+  }
 
   let currentResIndex = Math.max(
     0,
     resolutionLevels.indexOf(resolutionLevels[0])
   );
-  let currentDurIndex = Math.max(
-    0,
-    durationLevels.indexOf(options.duration || 10)
-  );
+  let currentDurIndex = 0;
 
   while (currentResIndex < resolutionLevels.length) {
     while (currentDurIndex < durationLevels.length) {
       try {
         const currentOptions = {
-          ...options,
+          ...generationOptions,
           resolution: resolutionLevels[currentResIndex],
           duration: durationLevels[currentDurIndex],
         };
@@ -685,7 +708,9 @@ export async function generateVideoWithRetry(
         // 已是最低配置仍然失败
         throw new APIException(
           EX.API_IMAGE_GENERATION_INSUFFICIENT_POINTS,
-          "积分不足，已自动降至最低画质与时长仍然不足，请前往即梦官网 https://jimeng.jianying.com 充值积分"
+          fallbackPolicy === "exact"
+            ? "积分不足，严格模式不会自动降低画质或时长，请充值积分或明确启用自动降级"
+            : "积分不足，已自动降至最低画质与时长仍然不足，请前往即梦官网 https://jimeng.jianying.com 充值积分"
         );
       }
     }

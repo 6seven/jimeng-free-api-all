@@ -15,6 +15,13 @@
 
 ## 更新日志
 
+### 2026-08-27
+
+- **新增 MCP Server**：提供 `jimeng_get_balance`、`jimeng_list_models`、`jimeng_generate_image`、`jimeng_generate_video` 四个 stdio 工具。
+- **支持充值积分模式**：积分查询包含购买、赠送和 VIP 积分，生成前后返回可观测积分消耗，不向 MCP 客户端暴露 `sessionid`。
+- **取消自动领取免费积分**：余额不足时直接返回错误，不再调用免费积分领取接口。
+- **增加严格生成策略**：MCP 默认使用 `fallback_policy=exact`，不会在积分不足时自动降低画质、时长或分辨率。
+
 ### 2026-06-24
 
 - **适配即梦官网新图片模型**：新增 `jimeng-image-5.0-lite`（`high_aes_general_v50`），并补充 `jimeng-image-4.7`、`jimeng-image-4.6`；图片默认模型更新为 5.0 Lite，4.x/5.x 支持 2K 默认与 4K 请求。
@@ -54,7 +61,7 @@
 🚀 **核心亮点**：
 
 - **超强模型支持**：集成图像模型（5.0 Lite/4.7/4.6/4.5/4.1/4.0/3.1/3.0/2.0 Pro）和视频模型（Seedance 2.0 Mini/Fast/Pro、Seedance 1.5 Pro、3.0 Pro/3.0/3.0 Fast/S2.0/2.0 Pro），并支持自动同步即梦官网最新模型列表。
-- **完全免费体验**：目前官方每日赠送 66 积分，支持多路 Token 轮询，最大化利用免费额度。
+- **自有账号积分**：使用账号现有的购买、赠送和 VIP 积分，支持单账号或多 Token 调用。
 - **可视化管理**：内置功能强大的 Web 管理控制台，支持实时监控和媒体管理。
 - **OpenAI 兼容**：完全兼容 OpenAI 接口格式，可直接接入大多数现有 AI 应用。
 - **零配置部署**：通过 Docker 一键启动，开箱即用。
@@ -153,7 +160,7 @@ cd jimeng-free-api-all
 
 ### 2. 安装依赖
 
-需要 Node.js 环境（推荐 v16+）：
+需要 Node.js 20.19–20.x、22.12–22.x，或 24.x：
 
 ```bash
 npm install
@@ -279,6 +286,101 @@ Authorization: Bearer sessionid_1,sessionid_2,sessionid_3
 返回所有可用模型及其配置信息。
 
 默认返回内置兜底模型列表；如果请求带有即梦 `Authorization`，服务会实时拉取官网图片/视频模型配置并缓存结果。可使用 `?refresh=true` 强制刷新缓存，使用 `?type=image` 或 `?type=video` 只返回指定类型模型。
+
+### 3. 生成降级策略
+
+图片和视频生成接口支持 `fallback_policy`：
+
+- `auto`：积分不足时自动降低分辨率，视频还可能降低时长。HTTP API 默认使用此模式。
+- `exact`：严格执行本次请求，不自动降级。MCP 默认使用此模式。
+
+余额为零时，服务会直接返回积分不足，不会自动领取免费积分。购买、赠送和 VIP 积分的实际扣减顺序由即梦服务端决定。
+
+---
+
+## 🔌 MCP Server
+
+MCP Server 是现有 HTTP API 的本地 stdio 适配层。HTTP 服务必须先启动，MCP 进程通过 `JIMENG_API_BASE_URL` 调用它。
+
+### 1. 构建并启动 HTTP API
+
+```bash
+npm install
+npm run build
+SERVER_HOST=127.0.0.1 npm start
+```
+
+默认 HTTP 地址为 `http://127.0.0.1:8000`。付费账号服务建议只监听本机，避免在局域网或公网暴露即梦账号凭证。
+
+使用本仓库构建 Docker 镜像时：
+
+```bash
+docker build -t jimeng-paid-api .
+docker run -d --init --name jimeng-paid-api \
+  -p 127.0.0.1:8001:8000 \
+  -v jimeng-paid-data:/app/data \
+  jimeng-paid-api
+```
+
+这时将 `JIMENG_API_BASE_URL` 配置为 `http://127.0.0.1:8001`。
+
+### 2. 配置 MCP
+
+复制 `.env.example` 中的配置，或者在 MCP Host 配置中直接设置环境变量：
+
+```env
+JIMENG_API_BASE_URL=http://127.0.0.1:8000
+JIMENG_SESSION_ID=你的即梦sessionid
+JIMENG_MCP_REQUEST_TIMEOUT_MS=1500000
+```
+
+`JIMENG_SESSION_ID` 只允许配置一个账号。它不会作为 Tool 参数或 Tool 结果提供给模型。
+
+通用 MCP Host 配置示例：
+
+```json
+{
+  "mcpServers": {
+    "jimeng": {
+      "command": "node",
+      "args": ["/项目绝对路径/dist/mcp/index.js"],
+      "env": {
+        "JIMENG_API_BASE_URL": "http://127.0.0.1:8000",
+        "JIMENG_SESSION_ID": "你的即梦sessionid",
+        "JIMENG_MCP_REQUEST_TIMEOUT_MS": "1500000"
+      }
+    }
+  }
+}
+```
+
+也可以直接启动 stdio Server：
+
+```bash
+JIMENG_SESSION_ID="$JIMENG_SESSION_ID" npm run start:mcp
+```
+
+stdio 模式会等待 MCP Host 从 stdin 发送协议消息，手动启动后没有交互提示属于正常行为。
+
+### 3. MCP Tools
+
+| Tool | 功能 | 是否消耗积分 |
+| :--- | :--- | :--- |
+| `jimeng_get_balance` | 查询购买、赠送、VIP 和总积分 | 否 |
+| `jimeng_list_models` | 获取图片或视频模型配置 | 否 |
+| `jimeng_generate_image` | 文生图或参考图生图 | 是 |
+| `jimeng_generate_video` | 文生视频或首尾帧视频 | 是 |
+
+图片输入只接受 PNG、JPEG 或 WebP 的 base64 data URL，单张最大 20 MiB。MCP 不接受本地文件路径或远程图片 URL，避免读取任意文件或访问内网地址。视频最多接受两张首尾帧图片。
+
+生成工具默认 `allow_fallback=false`。只有明确传入 `allow_fallback=true` 时，服务才会在积分不足时尝试降低生成规格。媒体结果默认返回 URL，不会把大型视频写入 MCP 消息。
+
+### 4. 验证
+
+```bash
+npm test
+npm run build
+```
 
 ---
 

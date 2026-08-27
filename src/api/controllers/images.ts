@@ -3,7 +3,7 @@ import _ from "lodash";
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
 import util from "@/lib/util.ts";
-import { getCredit, receiveCredit, request, uploadFile } from "./core.ts";
+import { ensureCreditAvailable, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
 import { JimengModelConfig, resolveImageModelConfig } from "./models.ts";
 
@@ -265,8 +265,7 @@ export async function generateImages(
   logger.info(`   🎯 模式: ${hasFilePath ? "混合(参考图)" : "文生图"}`);
   logger.info(`═══════════════════════════════════════════════════════════\n`);
 
-  const { totalCredit } = await getCredit(refreshToken);
-  if (totalCredit <= 0) await receiveCredit(refreshToken);
+  await ensureCreditAvailable(refreshToken);
 
   const componentId = util.uuid();
 
@@ -630,15 +629,30 @@ export async function generateImagesWithRetry(
     sampleStrength?: number;
     negativePrompt?: string;
     filePath?: string;
+    fallbackPolicy?: "auto" | "exact";
   },
   refreshToken: string
 ): Promise<string[]> {
+  const { fallbackPolicy = "auto", ...generationOptions } = options;
   const modelConfig = await resolveImageModelConfig(_model, refreshToken);
-  const resolutionLevels = getImageResolutionFallbacks(
+  if (
+    fallbackPolicy === "exact" &&
+    options.resolution &&
+    !modelConfig.supportedResolutions.includes(options.resolution)
+  ) {
+    throw new APIException(
+      EX.API_REQUEST_PARAMS_INVALID,
+      `模型 ${_model} 不支持分辨率 ${options.resolution}`
+    );
+  }
+  const availableResolutionLevels = getImageResolutionFallbacks(
     _model,
     options.resolution,
     modelConfig
   );
+  const resolutionLevels = fallbackPolicy === "exact"
+    ? availableResolutionLevels.slice(0, 1)
+    : availableResolutionLevels;
   let currentResIndex = Math.max(
     0,
     resolutionLevels.indexOf(resolutionLevels[0])
@@ -647,7 +661,7 @@ export async function generateImagesWithRetry(
   while (currentResIndex < resolutionLevels.length) {
     try {
       const currentOptions = {
-        ...options,
+        ...generationOptions,
         resolution: resolutionLevels[currentResIndex],
       };
       logger.info(`尝试生成图像，分辨率: ${currentOptions.resolution}`);
@@ -676,7 +690,9 @@ export async function generateImagesWithRetry(
       if (isInsufficientCredits) {
         throw new APIException(
           EX.API_IMAGE_GENERATION_INSUFFICIENT_POINTS,
-          "积分不足，已自动降至最低画质仍然不足，请前往即梦官网 https://jimeng.jianying.com 充值积分"
+          fallbackPolicy === "exact"
+            ? "积分不足，严格模式不会自动降低画质，请充值积分或明确启用自动降级"
+            : "积分不足，已自动降至最低画质仍然不足，请前往即梦官网 https://jimeng.jianying.com 充值积分"
         );
       }
 

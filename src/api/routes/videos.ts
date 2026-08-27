@@ -21,9 +21,10 @@ export default {
                 .validate('body.prompt', _.isString)
                 .validate('body.ratio', v => _.isUndefined(v) || _.isString(v))
                 .validate('body.resolution', v => _.isUndefined(v) || _.isString(v))
-                .validate('body.duration', v => _.isUndefined(v) || _.isFinite(v))
+                .validate('body.duration', v => _.isUndefined(v) || v === 5 || v === 10)
                 .validate('body.file_paths', v => _.isUndefined(v) || _.isArray(v))
                 .validate('body.response_format', v => _.isUndefined(v) || _.isString(v))
+                .validate('body.fallback_policy', v => _.isUndefined(v) || v === 'auto' || v === 'exact')
                 .validate('headers.authorization', _.isString);
 
             // refresh_token切分
@@ -39,9 +40,10 @@ export default {
                 prompt,
                 ratio,
                 resolution,
-                duration = 10,
+                duration,
                 file_paths = [],
-                response_format = "url"
+                response_format = "url",
+                fallback_policy: fallbackPolicy = "auto"
             } = request.body;
 
             // 处理文件上传
@@ -65,7 +67,8 @@ export default {
                     ratio,
                     resolution,
                     duration,
-                    filePaths
+                    filePaths,
+                    fallbackPolicy
                 },
                 token
             );

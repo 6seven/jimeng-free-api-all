@@ -21,6 +21,7 @@ export default {
         .validate("body.resolution", v => _.isUndefined(v) || _.isString(v))
         .validate("body.sample_strength", v => _.isUndefined(v) || _.isFinite(v))
         .validate("body.response_format", v => _.isUndefined(v) || _.isString(v))
+        .validate("body.fallback_policy", v => _.isUndefined(v) || v === "auto" || v === "exact")
         .validate("body.filePath", v => _.isUndefined(v) || _.isString(v))
         .validate("headers.authorization", _.isString);
       // refresh_token切分
@@ -38,6 +39,7 @@ export default {
         resolution,
         sample_strength: sampleStrength,
         response_format,
+        fallback_policy: fallbackPolicy = "auto",
         filePath: bodyFilePath,
       } = request.body;
       
@@ -61,6 +63,7 @@ export default {
         sampleStrength,
         negativePrompt,
         filePath,
+        fallbackPolicy,
       }, token);
       
       // 记录统计和媒体

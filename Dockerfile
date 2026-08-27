@@ -10,7 +10,7 @@ WORKDIR /app
 COPY package.json yarn.lock ./
 
 # 安装所有依赖（包括 devDependencies 用于构建）
-RUN yarn install --frozen-lockfile --registry https://registry.npmmirror.com/ --ignore-engines
+RUN yarn install --frozen-lockfile --registry https://registry.npmmirror.com/
 
 # 复制源代码并构建
 COPY . .
@@ -18,7 +18,7 @@ RUN yarn run build
 
 # 清理开发依赖，只保留生产依赖
 RUN rm -rf node_modules && \
-    yarn install --production --frozen-lockfile --registry https://registry.npmmirror.com/ --ignore-engines
+    yarn install --production --frozen-lockfile --registry https://registry.npmmirror.com/
 
 # 最终运行镜像 - 使用更小的基础镜像
 FROM node:20-alpine
