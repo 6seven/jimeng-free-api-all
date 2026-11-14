@@ -8,6 +8,7 @@ import token from './token.js';
 import models from './models.ts';
 import videos from './videos.ts';
 import dashboard from './dashboard.ts';
+import generationTasks from './generation-tasks.ts';
 
 export default [
     {
@@ -39,5 +40,6 @@ export default [
     token,
     models,
     videos,
-    dashboard
+    dashboard,
+    generationTasks
 ];

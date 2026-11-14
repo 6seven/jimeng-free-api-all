@@ -9,6 +9,7 @@ import EX from "@/api/consts/exceptions.ts";
 import { createParser } from "eventsource-parser";
 import logger from "@/lib/logger.ts";
 import util from "@/lib/util.ts";
+import { generationTaskContext, reuseTaskUpload } from "../../lib/generation-task-context.ts";
 
 // 模型名称
 const MODEL_NAME = "jimeng";
@@ -135,6 +136,9 @@ export async function request(
   refreshToken: string,
   options: AxiosRequestConfig = {}
 ) {
+  const task = generationTaskContext.getStore();
+  const submitting = !!task && uri === "/mweb/v1/aigc_draft/generate";
+  if (submitting) task.beforeSubmit();
   const token = await acquireToken(refreshToken);
   const deviceTime = util.unixTimestamp();
   const sign = util.md5(
@@ -161,11 +165,11 @@ export async function request(
 
   logger.info(`发送请求: ${method.toUpperCase()} ${fullUrl}`);
   logger.info(`请求参数: ${JSON.stringify(requestParams)}`);
-  logger.info(`请求数据: ${JSON.stringify(options.data || {})}`);
+  if (!task) logger.info(`请求数据: ${JSON.stringify(options.data || {})}`);
 
   // 添加重试逻辑
   let retries = 0;
-  const maxRetries = 3; // 最大重试次数
+  const maxRetries = submitting ? 0 : 3;
   let lastError = null;
 
   while (retries <= maxRetries) {
@@ -195,7 +199,7 @@ export async function request(
       // 记录响应数据摘要
       const responseDataSummary = JSON.stringify(response.data).substring(0, 500) +
         (JSON.stringify(response.data).length > 500 ? "..." : "");
-      logger.info(`响应数据摘要: ${responseDataSummary}`);
+      if (!task) logger.info(`响应数据摘要: ${responseDataSummary}`);
 
       // 检查HTTP状态码
       if (response.status >= 400) {
@@ -206,11 +210,15 @@ export async function request(
         }
       }
 
-      return checkResult(response);
+      const result = checkResult(response);
+      if (submitting && result?.aigc_data?.history_record_id) {
+        task.submitted(String(result.aigc_data.history_record_id));
+      }
+      return result;
     }
     catch (error) {
       lastError = error;
-      logger.error(`请求失败 (尝试 ${retries + 1}/${maxRetries + 1}): ${error.message}`);
+      logger.error(`请求失败 (尝试 ${retries + 1}/${maxRetries + 1}): ${task ? "Task request failed" : error.message}`);
 
       // 如果是网络错误或超时，尝试重试
       if ((error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' ||
@@ -226,10 +234,10 @@ export async function request(
   }
 
   // 所有重试都失败了，抛出最后一个错误
-  logger.error(`请求失败，已重试 ${retries} 次: ${lastError.message}`);
+  logger.error(`请求失败，已重试 ${retries} 次: ${task ? "Task request failed" : lastError.message}`);
   if (lastError.response) {
     logger.error(`响应状态: ${lastError.response.status}`);
-    logger.error(`响应数据: ${JSON.stringify(lastError.response.data)}`);
+    if (!task) logger.error(`响应数据: ${JSON.stringify(lastError.response.data)}`);
   }
   throw lastError;
 }
@@ -261,25 +269,7 @@ export async function checkFileUrl(fileUrl: string) {
   }
 }
 
-/**
- * 上传文件
- *
- * @param refreshToken 用于刷新access_token的refresh_token
- * @param fileUrl 文件URL或BASE64数据或本地路径
- * @param isVideoImage 是否是用于视频图像
- * @returns 上传结果，包含image_uri
- */
-export async function uploadFile(
-  refreshToken: string,
-  fileUrl: string,
-  isVideoImage: boolean = false
-): Promise<{ image_uri: string; uri: string }> {
-  // 只显示类型信息，不显示完整的base64内容
-  const fileDesc = fileUrl.startsWith('data:')
-    ? `base64图片(${fileUrl.length}字符)`
-    : fileUrl.substring(0, 100);
-  logger.info(`开始上传文件: ${fileDesc}`);
-
+export async function readUploadSource(fileUrl: string): Promise<{ bytes: Buffer; filename: string }> {
   // 获取文件内容
   let fileData: Buffer;
   let filename: string;
@@ -311,129 +301,140 @@ export async function uploadFile(
     fileData = fs.readFileSync(absolutePath);
   }
 
-  logger.info(`文件大小: ${fileData.length} bytes, 文件名: ${filename}`);
+  return { bytes: fileData, filename };
+}
 
-  // 获取上传令牌
-  const uploadAuth = await request(
-    'POST',
-    '/mweb/v1/get_upload_token?aid=513695&da_version=3.2.2&aigc_features=app_lip_sync',
-    refreshToken,
-    { data: { scene: 2 } }
-  );
+export async function uploadFile(
+  refreshToken: string,
+  fileUrl: string,
+  isVideoImage: boolean = false
+): Promise<{ image_uri: string; uri: string }> {
+  const { bytes: fileData, filename } = await readUploadSource(fileUrl);
+  return reuseTaskUpload(refreshToken, fileData, async () => {
+    logger.info(`文件大小: ${fileData.length} bytes, 文件名: ${filename}`);
 
-  if (!uploadAuth || !uploadAuth.access_key_id) {
-    throw new APIException(EX.API_REQUEST_FAILED, '获取上传凭证失败，账号可能已掉线');
-  }
+    // 获取上传令牌
+    const uploadAuth = await request(
+      'POST',
+      '/mweb/v1/get_upload_token?aid=513695&da_version=3.2.2&aigc_features=app_lip_sync',
+      refreshToken,
+      { data: { scene: 2 } }
+    );
 
-  logger.info('获取上传令牌成功');
-
-  // 计算文件CRC32 - 注意：需要转换为无符号整数再转十六进制
-  // crc-32 包返回有符号整数，需要 >>> 0 转换为无符号
-  const crc32Value = util.crc32(fileData);
-  const imageCrc32 = (crc32Value >>> 0).toString(16);
-  logger.info(`文件CRC32: ${imageCrc32}`);
-
-  // 准备获取上传凭证的请求参数
-  const getUploadImageProofRequestParams = {
-    Action: 'ApplyImageUpload',
-    FileSize: fileData.length,
-    ServiceId: 'tb4s082cfz',
-    Version: '2018-08-01',
-    s: util.generateRandomString({ length: 11, charset: 'alphanumeric' }),
-  };
-
-  // 生成AWS签名请求头
-  const requestHeadersInfo = await generateAWSAuthorizationHeader(
-    uploadAuth.access_key_id,
-    uploadAuth.secret_access_key,
-    uploadAuth.session_token,
-    'cn-north-1',
-    'imagex',
-    'GET',
-    getUploadImageProofRequestParams,
-  );
-
-  // 获取图片上传凭证
-  const uploadImgRes = await axios.get(
-    'https://imagex.bytedanceapi.com/?' + new URLSearchParams(getUploadImageProofRequestParams as any).toString(),
-    { headers: requestHeadersInfo, timeout: 30000 }
-  );
-
-  if (uploadImgRes.data?.['Response ']?.hasOwnProperty('Error')) {
-    throw new APIException(EX.API_REQUEST_FAILED, uploadImgRes.data['Response ']['Error']['Message']);
-  }
-
-  const UploadAddress = uploadImgRes.data.Result.UploadAddress;
-  const uploadImgUrl = `https://${UploadAddress.UploadHosts[0]}/upload/v1/${UploadAddress.StoreInfos[0].StoreUri}`;
-
-  logger.info(`上传图片到: ${uploadImgUrl}`);
-
-  // 上传图片
-  const imageUploadRes = await axios.post(
-    uploadImgUrl,
-    fileData,
-    {
-      headers: {
-        Authorization: UploadAddress.StoreInfos[0].Auth,
-        'Content-Crc32': imageCrc32,
-        'Content-Type': 'application/octet-stream',
-      },
-      timeout: 60000,
+    if (!uploadAuth || !uploadAuth.access_key_id) {
+      throw new APIException(EX.API_REQUEST_FAILED, '获取上传凭证失败，账号可能已掉线');
     }
-  );
 
-  if (imageUploadRes.data.code !== 2000) {
-    throw new APIException(EX.API_REQUEST_FAILED, imageUploadRes.data.message || '上传文件失败');
-  }
+    logger.info('获取上传令牌成功');
 
-  logger.info('图片上传成功，提交上传');
+    // 计算文件CRC32 - 注意：需要转换为无符号整数再转十六进制
+    // crc-32 包返回有符号整数，需要 >>> 0 转换为无符号
+    const crc32Value = util.crc32(fileData);
+    const imageCrc32 = (crc32Value >>> 0).toString(16);
+    logger.info(`文件CRC32: ${imageCrc32}`);
 
-  // 提交上传
-  const commitImgParams = {
-    Action: 'CommitImageUpload',
-    FileSize: fileData.length,
-    ServiceId: 'tb4s082cfz',
-    Version: '2018-08-01',
-  };
+    // 准备获取上传凭证的请求参数
+    const getUploadImageProofRequestParams = {
+      Action: 'ApplyImageUpload',
+      FileSize: fileData.length,
+      ServiceId: 'tb4s082cfz',
+      Version: '2018-08-01',
+      s: util.generateRandomString({ length: 11, charset: 'alphanumeric' }),
+    };
 
-  const commitImgContent = {
-    SessionKey: UploadAddress.SessionKey,
-  };
+    // 生成AWS签名请求头
+    const requestHeadersInfo = await generateAWSAuthorizationHeader(
+      uploadAuth.access_key_id,
+      uploadAuth.secret_access_key,
+      uploadAuth.session_token,
+      'cn-north-1',
+      'imagex',
+      'GET',
+      getUploadImageProofRequestParams,
+    );
 
-  const commitImgHead = await generateAWSAuthorizationHeader(
-    uploadAuth.access_key_id,
-    uploadAuth.secret_access_key,
-    uploadAuth.session_token,
-    'cn-north-1',
-    'imagex',
-    'POST',
-    commitImgParams,
-    commitImgContent,
-  );
+    // 获取图片上传凭证
+    const uploadImgRes = await axios.get(
+      'https://imagex.bytedanceapi.com/?' + new URLSearchParams(getUploadImageProofRequestParams as any).toString(),
+      { headers: requestHeadersInfo, timeout: 30000 }
+    );
 
-  const commitImg = await axios.post(
-    'https://imagex.bytedanceapi.com/?' + new URLSearchParams(commitImgParams as any).toString(),
-    commitImgContent,
-    {
-      headers: {
-        ...commitImgHead,
-        'Content-Type': 'application/json',
-      },
-      timeout: 30000,
+    if (uploadImgRes.data?.['Response ']?.hasOwnProperty('Error')) {
+      throw new APIException(EX.API_REQUEST_FAILED, uploadImgRes.data['Response ']['Error']['Message']);
     }
-  );
 
-  if (commitImg.data?.['Response ']?.hasOwnProperty('Error')) {
-    throw new APIException(EX.API_REQUEST_FAILED, commitImg.data['Response ']['Error']['Message']);
-  }
+    const UploadAddress = uploadImgRes.data.Result.UploadAddress;
+    const uploadImgUrl = `https://${UploadAddress.UploadHosts[0]}/upload/v1/${UploadAddress.StoreInfos[0].StoreUri}`;
 
-  const imageUri = commitImg.data.Result.Results[0].Uri;
-  logger.info(`文件上传成功，URI: ${imageUri}`);
+    logger.info(`上传图片到: ${uploadImgUrl}`);
 
-  return {
-    image_uri: imageUri,
-    uri: imageUri,
-  };
+    // 上传图片
+    const imageUploadRes = await axios.post(
+      uploadImgUrl,
+      fileData,
+      {
+        headers: {
+          Authorization: UploadAddress.StoreInfos[0].Auth,
+          'Content-Crc32': imageCrc32,
+          'Content-Type': 'application/octet-stream',
+        },
+        timeout: 60000,
+      }
+    );
+
+    if (imageUploadRes.data.code !== 2000) {
+      throw new APIException(EX.API_REQUEST_FAILED, imageUploadRes.data.message || '上传文件失败');
+    }
+
+    logger.info('图片上传成功，提交上传');
+
+    // 提交上传
+    const commitImgParams = {
+      Action: 'CommitImageUpload',
+      FileSize: fileData.length,
+      ServiceId: 'tb4s082cfz',
+      Version: '2018-08-01',
+    };
+
+    const commitImgContent = {
+      SessionKey: UploadAddress.SessionKey,
+    };
+
+    const commitImgHead = await generateAWSAuthorizationHeader(
+      uploadAuth.access_key_id,
+      uploadAuth.secret_access_key,
+      uploadAuth.session_token,
+      'cn-north-1',
+      'imagex',
+      'POST',
+      commitImgParams,
+      commitImgContent,
+    );
+
+    const commitImg = await axios.post(
+      'https://imagex.bytedanceapi.com/?' + new URLSearchParams(commitImgParams as any).toString(),
+      commitImgContent,
+      {
+        headers: {
+          ...commitImgHead,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    if (commitImg.data?.['Response ']?.hasOwnProperty('Error')) {
+      throw new APIException(EX.API_REQUEST_FAILED, commitImg.data['Response ']['Error']['Message']);
+    }
+
+    const imageUri = commitImg.data.Result.Results[0].Uri;
+    logger.info(`文件上传成功，URI: ${imageUri}`);
+
+    return {
+      image_uri: imageUri,
+      uri: imageUri,
+    };
+  });
 }
 
 /**
@@ -529,7 +530,7 @@ export function checkResult(result: AxiosResponse) {
   if (ret === '0') return data;
   
   // 记录详细的API错误信息
-  logger.error(`❌ [API错误] 错误码: ${ret}, 错误消息: ${errmsg}`);
+  logger.error(`❌ [API错误] 错误码: ${ret}, 错误消息: ${generationTaskContext.getStore() ? "Task request failed" : errmsg}`);
   
   // 即梦积分不足错误码：5000 (旧) 或 1006 (新)
   if (ret === '5000' || ret === '1006')

@@ -5,6 +5,7 @@ import EX from "@/api/consts/exceptions.ts";
 import util from "@/lib/util.ts";
 import { ensureCreditAvailable, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
+import { generationTaskContext } from "../../lib/generation-task-context.ts";
 import { JimengModelConfig, resolveImageModelConfig } from "./models.ts";
 
 const DEFAULT_ASSISTANT_ID = 513695;
@@ -197,10 +198,11 @@ export async function generateImages(
       uploadID = uploadResult.image_uri;
       logger.info(`✅ [参考图] 上传成功 | URI: ${uploadID}`);
     } catch (error) {
-      logger.error(`❌ [参考图] 上传失败: ${error.message}`);
+      const message = generationTaskContext.getStore() ? "Reference upload failed" : error.message;
+      logger.error(`❌ [参考图] 上传失败: ${message}`);
       throw new APIException(
         EX.API_REQUEST_FAILED,
-        `参考图上传失败: ${error.message}`
+        `参考图上传失败: ${message}`
       );
     }
   }
@@ -216,6 +218,7 @@ export async function generateImages(
   let resolutionType = resolution; // 用户指定优先
 
   if (!modelConfig.supportedResolutions.includes(resolutionType)) {
+    if (generationTaskContext.getStore()) throw new APIException(EX.API_REQUEST_PARAMS_INVALID, "Requested resolution is unavailable");
     resolutionType = modelConfig.defaultResolution;
     if (resolution !== resolutionType) {
       logger.warn(`⚠️ [分辨率] ${modelName} 不支持 ${resolution}，已自动调整为 ${resolutionType}`);
@@ -248,7 +251,7 @@ export async function generateImages(
   // 如果 prompt 里检测到且 ratio 是默认 "1:1" (可能是未传)，则覆盖。
   // 这里的风险是用户真的想 1:1 但 prompt 里有 "16:9"。
   // 鉴于这是一个 "Chat" driven API often，prompt detection is feature.
-  if (detectedRatioKey && validRatio === "1:1") {
+  if (detectedRatioKey && validRatio === "1:1" && !generationTaskContext.getStore()) {
     validRatio = detectedRatioKey;
   }
 
@@ -444,7 +447,7 @@ export async function generateImages(
   };
   
   // 输出完整请求数据用于调试
-  logger.info(`📤 [请求数据] ${JSON.stringify(requestData)}`);
+  if (!generationTaskContext.getStore()) logger.info(`📤 [请求数据] ${JSON.stringify(requestData)}`);
 
   const { aigc_data } = await request(
     "post",
@@ -463,6 +466,11 @@ export async function generateImages(
   if (!historyId)
     throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录ID不存在");
 
+  return pollImageHistory(String(historyId), refreshToken);
+}
+
+export async function pollImageHistory(historyId: string, refreshToken: string): Promise<string[]> {
+  const task = generationTaskContext.getStore();
   // 状态码说明：
   // 20 = 初始提交/队列中
   // 42 = 处理中（jimeng-4.5 新状态）
@@ -481,7 +489,7 @@ export async function generateImages(
 
   while (
     PROCESSING_STATES.includes(status) &&
-    (!item_list || item_list.length === 0) &&
+    (task || !item_list || item_list.length === 0) &&
     retryCount < MAX_POLL_RETRIES
   ) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -493,7 +501,7 @@ export async function generateImages(
       {
         data: {
           history_ids: [historyId],
-          image_info: {
+          ...(task ? {} : { image_info: {
             width: 2048,
             height: 2048,
             format: "webp",
@@ -583,7 +591,7 @@ export async function generateImages(
                 format: "webp",
               },
             ],
-          },
+          } }),
           http_common_info: {
             aid: Number(DEFAULT_ASSISTANT_ID),
           },
@@ -606,12 +614,16 @@ export async function generateImages(
   }
 
   if (status === FAIL_STATE) {
+    generationTaskContext.getStore()?.providerFailed();
     if (failCode === "2038") throw new APIException(EX.API_CONTENT_FILTERED);
     else throw new APIException(EX.API_IMAGE_GENERATION_FAILED);
   }
+  if (task && ![21, 50].includes(status)) throw new Error("Original image result is not complete");
   return item_list.map((item) => {
-    if (!item?.image?.large_images?.[0]?.image_url)
+    if (!item?.image?.large_images?.[0]?.image_url) {
+      if (task) throw new Error("Original image result is unavailable");
       return item?.common_attr?.cover_url || null;
+    }
     return item.image.large_images[0].image_url;
   });
 }

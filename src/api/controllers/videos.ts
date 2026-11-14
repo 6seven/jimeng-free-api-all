@@ -5,6 +5,7 @@ import EX from "@/api/consts/exceptions.ts";
 import util from "@/lib/util.ts";
 import { ensureCreditAvailable, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
+import { generationTaskContext } from "../../lib/generation-task-context.ts";
 import { JimengModelConfig, resolveVideoModelConfig } from "./models.ts";
 import { getVideoDurationFallbacks } from "./video-policy.ts";
 
@@ -149,13 +150,13 @@ function getVideoResolutionFallbacks(
 
 const VIDEO_PROCESSING_STATES = [20, 42, 45];
 
-function extractVideoUrlFromItemList(itemList: any[] = []) {
+function extractVideoUrlFromItemList(itemList: any[] = [], originalOnly = false) {
   for (const item of itemList) {
     const url =
-      item?.video?.transcoded_video?.origin?.video_url ||
+      item?.video?.transcoded_video?.origin?.video_url || (!originalOnly && (
       item?.video?.play_url ||
       item?.video?.download_url ||
-      item?.video?.url;
+      item?.video?.url));
     if (url) return url;
   }
 }
@@ -258,6 +259,7 @@ export async function generateVideo(
   const model = modelConfig.modelReqKey || getModel(_model);
   let finalResolution = resolution;
   if (!modelConfig.supportedResolutions.includes(finalResolution)) {
+    if (generationTaskContext.getStore()) throw new APIException(EX.API_REQUEST_PARAMS_INVALID, "Requested resolution is unavailable");
     logger.warn(
       `视频模型 ${_model} 不支持分辨率 ${resolution}，已调整为 ${modelConfig.defaultResolution}`
     );
@@ -312,6 +314,7 @@ export async function generateVideo(
 
   // 2.0系列强制5秒
   if (!supportsLongDuration) {
+    if (generationTaskContext.getStore() && duration !== 5) throw new APIException(EX.API_REQUEST_PARAMS_INVALID, "Requested duration is unavailable");
     finalDuration = 5;
     if (duration !== 5) {
       logger.info(`2.0系列模型只支持5秒，已自动调整`);
@@ -319,7 +322,7 @@ export async function generateVideo(
   } else {
     // 3.0系列: 检测提示词中的时长
     const detectedDuration = detectVideoDuration(prompt);
-    if (detectedDuration !== null && duration === 10) {
+    if (detectedDuration !== null && duration === 10 && !generationTaskContext.getStore()) {
       // 如果参数是默认值且 prompt 中有显式指定，使用 prompt 中的值
       finalDuration = detectedDuration;
     }
@@ -367,9 +370,10 @@ export async function generateVideo(
           uploadIDs.push(uploadResult.image_uri);
         }
       } catch (e) {
-        logger.error(`上传失败: ${e.message}`);
-        if (i === 0)
-          throw new APIException(EX.API_REQUEST_FAILED, "首帧上传失败");
+        const task = generationTaskContext.getStore();
+        logger.error(`上传失败: ${task ? "Reference upload failed" : e.message}`);
+        if (i === 0 || task)
+          throw new APIException(EX.API_REQUEST_FAILED, task ? `第 ${i + 1} 帧上传失败` : "首帧上传失败");
       }
     }
 
@@ -501,7 +505,11 @@ export async function generateVideo(
   if (!historyId)
     throw new APIException(EX.API_VIDEO_GENERATION_FAILED, "记录ID不存在");
 
-  // 轮询获取结果
+  return pollVideoHistory(String(historyId), refreshToken);
+}
+
+export async function pollVideoHistory(historyId: string, refreshToken: string): Promise<string> {
+  const task = generationTaskContext.getStore();
   let status = 20,
     failCode,
     item_list = [];
@@ -536,15 +544,21 @@ export async function generateVideo(
         });
       }
 
-      const responseVideoUrl = extractVideoUrlFromResponse(result);
+      const responseVideoUrl = task ? undefined : extractVideoUrlFromResponse(result);
       if (responseVideoUrl) return responseVideoUrl;
 
       // Parse history
       let historyData;
-      if (useAlternativeApi && result.history_records?.length)
+      if (task) {
+        const records = [...(result.history_records || []), ...(result.history_list || [])];
+        historyData = result[historyId] || records.find((record) =>
+          String(record.history_record_id ?? record.history_id ?? record.id) === historyId);
+      } else if (useAlternativeApi && result.history_records?.length)
         historyData = result.history_records[0];
       else if (result.history_list?.length)
         historyData = result.history_list[0];
+      else if (result[historyId])
+        historyData = result[historyId];
 
       if (!historyData) {
         retryCount++;
@@ -559,15 +573,20 @@ export async function generateVideo(
       item_list = historyData.item_list || [];
 
       // Extraction Check
-      const tempVideoUrl = extractVideoUrlFromItemList(item_list);
+      const tempVideoUrl = !task || [21, 50].includes(status)
+        ? extractVideoUrlFromItemList(item_list, !!task) : undefined;
 
       if (tempVideoUrl) return tempVideoUrl; // Found it
 
       if (status === 30) {
+        generationTaskContext.getStore()?.providerFailed();
         throw new APIException(
           EX.API_VIDEO_GENERATION_FAILED,
           `生成失败: ${failCode}`
         );
+      }
+      if (task && !VIDEO_PROCESSING_STATES.includes(status)) {
+        throw new APIException(EX.API_VIDEO_GENERATION_FAILED, "Original video result is unavailable");
       }
 
       if (VIDEO_PROCESSING_STATES.includes(status)) {
@@ -578,7 +597,7 @@ export async function generateVideo(
       }
     } catch (e) {
       if (e instanceof APIException) throw e;
-      logger.error(`轮询出错: ${e.message}`);
+      logger.error(`轮询出错: ${task ? "Task polling failed" : e.message}`);
       retryCount++;
       await new Promise((r) => setTimeout(r, 5000));
     }
@@ -590,7 +609,7 @@ export async function generateVideo(
   }
 
   // Final Extraction (Redundant but safe)
-  const finalUrl = extractVideoUrlFromItemList(item_list);
+  const finalUrl = extractVideoUrlFromItemList(item_list, !!task);
   if (finalUrl) return finalUrl;
 
   throw new APIException(

@@ -13,6 +13,52 @@
 
 ---
 
+## 可恢复的原画质生成任务
+
+`GET /v1/media-capabilities` 返回 `{ "version": 1, "generation_tasks": true }` 时，客户端可使用任务接口。旧的图片、视频同步接口继续可用。
+
+提交任务使用 `POST /v1/generation-tasks`，携带 `Authorization: Bearer <单个账号 Token>` 和 `Idempotency-Key: <本次逻辑生成的唯一 ID>`，请求体为：
+
+```json
+{
+  "kind": "video",
+  "request": {
+    "model": "jimeng-video-seedance-2.0-pro",
+    "prompt": "生成内容描述",
+    "resolution": "1080p",
+    "ratio": "16:9",
+    "duration": 10,
+    "file_paths": ["/absolute/path/first.png", "/absolute/path/last.png"],
+    "fallback_policy": "exact",
+    "response_format": "url"
+  }
+}
+```
+
+图片使用 `kind: "image"` 和原图片接口的请求字段，例如 `filePath`。任务接口只支持 JSON；参考文件可以是网关本机路径、HTTP URL 或原始文件的 Base64 data URL。视频最多接收两张首尾帧，保持原有顺序。原文件字节不会缩放或重新编码；同一任务、账号内的相同内容只上传一次，只有成功上传的 URI 才被保存。
+
+提交返回 HTTP 202 和 `{ "id": "<同一个 ID>", "status": "queued" }`。使用相同账号调用 `GET /v1/generation-tasks/<ID>` 查询状态：`queued`、`running`、`completed`、`failed` 或 `outcome_unknown`。完成结果为：
+
+```json
+{
+  "id": "<同一个 ID>",
+  "status": "completed",
+  "result": {
+    "created": 1780000000,
+    "data": [{ "url": "https://provider.example/original-output" }]
+  }
+}
+```
+
+- 同账号、同 ID、相同规范化请求复用同一任务；请求字段或参考文件字节改变会返回 HTTP 409。不同账号不能查询对方任务。
+- `fallback_policy` 只能省略或为 `exact`，`response_format` 只能省略或为 `url`。显式分辨率、比例和时长不会被自动降级或提示词推断覆盖。
+- 新任务的图片查询不发送 `image_info` 尺寸或格式变换，完成后读取对应历史记录的 `large_images` 字段；视频只读取对应历史记录的 `transcoded_video.origin.video_url`。处理中预览、图片封面、视频播放地址或不匹配的历史记录不会替代生成结果。供应商未提供可用原始结果字段时，任务保留为 `outcome_unknown`。
+- 回执默认保存在 `data/generation-tasks/`，可用 `JIMENG_GENERATION_TASKS_DIR` 指定持久化目录。回执通过原子写入保存请求摘要、账号摘要、上传 URI、历史 ID 和结果引用，不保存原始提示词、媒体或 Token。视频任务结果不包含 `revised_prompt`。
+- 付费提交前保存提交标记；收到 `history_record_id` 后立即保存。断线不取消后台任务，重启后查询同 ID 只恢复历史轮询。结果不确定且没有历史 ID 时不会再次提交生成。
+- 完成或失败的结果引用保留 24 小时，过期后仅保留账号摘要、ID 和请求摘要，GET 或相同请求的 POST 返回 HTTP 410，仍阻止旧 ID 再次生成；参数冲突仍返回 HTTP 409。活跃和不确定任务不会因 TTL 被删除。HTTP 404/410、超时或 `outcome_unknown` 都不能作为自动新建生成任务的依据。需要保留进度时，部署必须挂载同一回执目录。
+
+离线验证使用 `npm test`；测试中的生成、上传和历史查询均为模拟请求，不消耗供应商积分。
+
 ## 更新日志
 
 ### 2026-08-27
